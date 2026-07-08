@@ -1,0 +1,108 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: resilient-api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Fail fast when Redis is down so the fail-open path triggers quickly instead of hanging.
+      timeout: 250ms
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 32
+          max-idle: 16
+          min-idle: 4
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 500
+        response-timeout: 5s
+      routes:
+        # Happy-path route: rate limited (global) + transient-fault retry with backoff.
+        - id: echo
+          uri: ${DOWNSTREAM_ECHO_URI:http://localhost:8081}
+          predicates:
+            - Path=/echo/**
+          filters:
+            - StripPrefix=1
+            - name: Retry
+              args:
+                retries: 3
+                statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
+                methods: GET
+                backoff:
+                  firstBackoff: 50ms
+                  maxBackoff: 500ms
+                  factor: 2
+                  basedOnPreviousValue: false
+
+        # Protected route: rate limit (global) + bulkhead + circuit breaker + time limiter,
+        # with a 503 fallback. Point this at a flaky/slow dependency to see resilience kick in.
+        - id: flaky
+          uri: ${DOWNSTREAM_FLAKY_URI:http://localhost:8081}
+          predicates:
+            - Path=/flaky/**
+          filters:
+            - StripPrefix=1
+            - name: Bulkhead
+              args:
+                name: flakyBh
+                maxConcurrentCalls: 20
+                maxWaitMillis: 0
+            - name: CircuitBreaker
+              args:
+                name: flakyCb
+                fallbackUri: forward:/__fallback
+
+# ---------------------------------------------------------------------------
+# Rate-limit policy (per-tenant quotas). All config-driven; no code changes to
+# add a tenant. Keys/tenants below are illustrative.
+# ---------------------------------------------------------------------------
+gateway:
+  ratelimit:
+    enabled: true
+    fail-open: true            # Redis down => allow traffic (availability over strict protection)
+    fallback-path: /__fallback
+    default-bucket:
+      limit: 100
+      window-seconds: 60
+    tenants:
+      free:
+        limit: 5
+        window-seconds: 10
+      premium:
+        limit: 1000
+        window-seconds: 60
+    api-keys:
+      key-free: free
+      key-premium: premium
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,gateway
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      slo:
+        http.server.requests: 5ms,10ms,25ms,50ms
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+logging:
+  level:
+    com.koutilya.gateway: INFO

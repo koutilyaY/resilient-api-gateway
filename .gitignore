@@ -1,0 +1,25 @@
+# Maven
+target/
+*.class
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+nbproject/
+
+# OS / misc
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Embedded Redis extracted binaries (created at test time)
+*.tmp
