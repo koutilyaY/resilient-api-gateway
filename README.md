@@ -183,44 +183,6 @@ The default test run needs no Docker and no network: embedded Redis ships an arm
 
 [`loadtest/ratelimit.js`](loadtest/ratelimit.js) drives steady premium load (to measure overhead) plus a bursty free tenant (to force 429s), with a `p(99)<6ms` threshold on the gateway latency trend.
 
-## Design FAQ
-
-<details>
-<summary><b>Why sliding-window-log over token-bucket or fixed-window?</b></summary>
-
-Fixed-window is cheapest but allows a 2× burst across a window boundary (5 requests at 0:09 + 5 at 0:11 with a 10s window). Token bucket is excellent for smoothing bursts, but its "current level" is awkward to compute atomically across a cluster without a second timestamp key or a more complex script. **Sliding-window-log** (a sorted set of timestamps) is *exact* — it counts precisely the requests in the trailing window with no boundary artifact — and maps naturally onto atomic Redis ZSET operations. Its cost is memory: O(limit) entries per active tenant. For per-tenant API quotas (hundreds/thousands per window) that's negligible; for very high-limit buckets, a **sliding-window-counter** (two fixed buckets, interpolated — O(1) memory, near-exact) is the natural swap — same filter, different script.
-</details>
-
-<details>
-<summary><b>How is atomicity guaranteed across gateway replicas?</b></summary>
-
-The count-and-record is a single Lua script executed by Redis, which is single-threaded and runs scripts atomically. There is no read-then-write in Java, so two replicas hitting the same tenant at the same instant cannot both read a stale count and both admit an over-limit request. The script *is* the critical section — no distributed lock, no `WATCH`/`MULTI` retries, one round trip (`EVALSHA`, not re-sending the script body).
-</details>
-
-<details>
-<summary><b>What happens when Redis is down?</b></summary>
-
-Configurable. Default **fail-open**: allow traffic, tag the response `X-RateLimit-Degraded: fail-open`, and log a warning — rate limiting is a *protection* layer, not correctness, so a Redis blip shouldn't take down all traffic. **Fail-closed** (503) is available for endpoints where exceeding the limit is worse than unavailability (paid metering, abuse-prone paths). A 250 ms Redis timeout keeps the failure path fast instead of hanging.
-</details>
-
-<details>
-<summary><b>Clock skew — you send <code>now</code> from the gateway; what about skewed clocks across replicas?</b></summary>
-
-The window boundary is computed from the caller-supplied `now`, so skew between gateways can shift a tenant's effective window by up to the skew. In practice hosts are NTP-synced to low double-digit milliseconds, immaterial next to multi-second windows. To eliminate it entirely, use Redis's own `TIME` command inside the script as the single authoritative clock — a one-line change, at the cost of losing the caller's notion of request time (which the tests rely on to inject time deterministically).
-</details>
-
-<details>
-<summary><b>Retry storms + circuit breakers — don't retries amplify an outage?</b></summary>
-
-That's exactly why the layers are ordered. Retry fires only on *transient* statuses (502/503/504) with bounded attempts and exponential backoff, and it sits *inside* the circuit breaker: once the breaker opens, calls short-circuit to the fallback and retries stop entirely. The bulkhead caps concurrent in-flight calls so a slow dependency can't consume the whole gateway, and rate limiting at the edge caps the input rate before any of this.
-</details>
-
-<details>
-<summary><b>How is per-request overhead kept low — and how do you know?</b></summary>
-
-One Redis round trip on the hot path (`EVALSHA`, non-blocking Lettuce), and rejections short-circuit before routing. It's *measured*, not assumed: `gateway.ratelimit.decision` is a Micrometer timer with p50/p95/p99 exported to Prometheus, so the overhead claim is a number you can scrape rather than a promise.
-</details>
-
 ## Production readiness / non-goals
 
 This is a focused, correct core. Before running it in production I would add:
